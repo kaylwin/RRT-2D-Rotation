@@ -1,15 +1,17 @@
-#include "helper.h"
+#include <memory>
+#include <random>
+#include <iostream>
 #include <box2d/b2_world.h>
 #include <box2d/b2_body.h>
 #include <box2d/b2_polygon_shape.h>
 #include <box2d/b2_fixture.h>
-#include <iostream>
 #include <box2d/b2_joint.h>
 #include <box2d/b2_distance_joint.h>
 #include <box2d/b2_gear_joint.h>
 #include <box2d/b2_time_of_impact.h>
-#include <memory>
-#include <random>
+#include "rrt_2d/Octree.h"
+#include "helper.h"
+#include "rrt_2d/Utils.h"
 
 // Define window height in meters
 #define WINDOW_HEIGHT 10.0f
@@ -27,12 +29,18 @@ b2World* world = nullptr;
 
 b2Body* groundBody;
 
-b2Body* platform;
+// The walls that the object is to avoid
 b2Body* leftWall;
 b2Body* rightWall;
 b2Body* topWall;
 b2Body* centerWall;
+b2Body* center2Wall;
+b2Body* center3Wall;
 
+
+// Used for searching collision
+
+std::vector<b2Body*> bodies;
 b2Body* goalBody;
 
 b2PolygonShape collisionShape;
@@ -40,6 +48,20 @@ b2Transform collisionTransform;
 
 b2PolygonShape robotShape;
 b2Transform robotTransform;
+
+template <typename THETA_TYPE>
+void wrap_theta(THETA_TYPE&& theta)
+{
+   if (theta < 0)
+   {
+       theta += 2 * M_PI;
+   }
+   else if (theta > 2 * M_PI)
+   {
+      theta -= 2 * M_PI;
+   }
+}
+
 
 struct Vertex
 {
@@ -49,7 +71,8 @@ struct Vertex
     uint32_t id;
     Vertex* p_vertex = nullptr;  // Previous vertex
 
-    Vertex(double x, double y, double theta, Vertex* p_vertex):x(x), y(y), theta(theta), p_vertex(p_vertex)
+    Vertex(double x, double y, double theta, Vertex* p_vertex):x(x), y(y), 
+        theta(theta), p_vertex(p_vertex)
     {
        id = m_id++;
     }
@@ -61,99 +84,98 @@ struct Vertex
     {
         m_id = 0;
     }
+    double theta_deg()
+    {
+        return theta * 180.0 / M_PI;
+    }
+
 private:
     static uint32_t m_id;
 };
+
 uint32_t Vertex::m_id = 0; // Definition for Vertex ID
 
-std::vector<std::unique_ptr<Vertex>> vertices{};
+std::vector<Vertex*> vertices{};
+std::vector<Vertex*> goal_points{};
 
+using Kpoint = keith::Octree<Vertex>::Point;
+keith::Octree<Vertex>* tree = nullptr;
 
-void createNewVertex()
+Vertex* createNewVertex()
 {
-    std::linear_congruential_engine<std::uint_fast32_t, 48271, 0, 2147483647> engine;
-    engine.seed(0);
-    auto grand = [&engine]()->double{ return engine() / static_cast<double>(INT_MAX);};
-    Vertex v{};
-    v.x = engine() / grand() * WINDOW_HEIGHT * aspect_ratio;
-    v.y = engine() / grand() * WINDOW_HEIGHT;
-    v.theta = grand() * 2 * M_PI;
+    static std::linear_congruential_engine<std::uint_fast32_t, 48271, 0, 2147483647> engine(0);
+    auto grand = [&]()->double{ return engine() / static_cast<double>(RAND_MAX);};
+    Vertex* v = new Vertex();
+    v->x = grand() * WINDOW_HEIGHT * aspect_ratio;
+    v->y = grand() * WINDOW_HEIGHT;
+    v->theta = grand() * 2 * M_PI;
+    v->p_vertex = nullptr;
+    return v;
 }
 
 /**
- * Compares to verticies in SE(2) and establishes a distance metric
- * @param a Vertex 1
- * @param b Vertex  2
- * @return
+ * Function will make sure that no more than 10cm will be covered
+ * between two vertices, this will make space exploration more efficient
+ * at least in R2 for simplicity S1 is not covered (e.g no explicit max on rotation)
+ * Function will set previous vertices for prev vertex
+ * @param new_vertex New Vertex
+ * @param prev_vertex Vertex already in tree
  */
-double compute_se2_metric(const Vertex& a, const Vertex& b)
+void insert_intermediary_vertices(Vertex* new_vertex, Vertex* prev_vertex)
 {
-    // Normalize the distance w/r to max distance on the map
-    double norm_eu_dist = (a.x - b.x) * (a.x - b.x)
-            + ((a.y - b.y) * (a.y - b.y));
-
-    // Metric assumes robot pivots on 1m axis and that this is w/r to a point on the head of the robot
-
-    // Obtain a Euclidean metric on SE(2)
-    double diff_angle = a.theta - b.theta;
-
-    if (diff_angle < 0)
-    {
-        diff_angle += 2*M_PI;
+    double dist_sq = (new_vertex->x - prev_vertex->x) * (new_vertex->x - prev_vertex->x)
+            + (new_vertex->y - prev_vertex->y) * (new_vertex->y - prev_vertex->y);
+    auto v_count = dist_sq / 1;
+    if (v_count < 1){
+        new_vertex->p_vertex = prev_vertex;
+        return;
     }
-    else if (diff_angle > 2*M_PI)
+
+    // Wrap theta
+    auto new_theta = (new_vertex->theta > M_PI) ? new_vertex->theta - 2*M_PI : new_vertex->theta;
+    auto prev_theta = (prev_vertex->theta > M_PI) ? new_vertex->theta - 2*M_PI : prev_vertex->theta;
+    auto total_theta = new_theta - prev_theta;
+    if (total_theta > M_PI){total_theta -= M_PI;} else if(total_theta < -M_PI){total_theta += M_PI;}
+
+    Vertex* previous = prev_vertex;
+    Vertex* int_vertex;
+    for (int i = 0; i < v_count; i++)
     {
-        diff_angle -= 2*M_PI;
+        int_vertex = new Vertex();
+        double x = previous->x + (new_vertex->x - prev_vertex->x) * 1 / v_count;
+        double y = previous->y + (new_vertex->y - prev_vertex->y) * 1 / v_count;
+        double theta = previous->theta + (total_theta) * 1 / v_count;
+
+        if (theta > 2 * M_PI)
+        {
+            theta -= 2 * M_PI;
+        }
+        else if(theta < 0){
+            theta += 2 * M_PI;
+        }
+
+        int_vertex->x = x;
+        int_vertex->y = y;
+        int_vertex->theta = theta;
+        int_vertex->p_vertex = previous;
+
+        // Don't do these out of order
+        previous = int_vertex;
+
+        tree->insert(Kpoint{int_vertex->x, int_vertex->y, int_vertex->theta}, int_vertex);
+        vertices.emplace_back(int_vertex);
     }
-    double theta_dist = abs(a.theta - b.theta);
 
-    return norm_eu_dist + theta_dist;
+    // Set the previous on the last vertex
+    new_vertex->p_vertex = int_vertex;
+
 }
 
 
 /**
- * Compare distance to all verticies and find the minimum vertex
- * @param new_vertex vertex to add
- * @return nearest Vertex
- */
-Vertex& nearest_vertex(Vertex& new_vertex)
-{
-    auto comp = [&new_vertex](std::unique_ptr<Vertex>& a, std::unique_ptr<Vertex>& b){
-        return compute_se2_metric(new_vertex, *a) < compute_se2_metric(new_vertex, *b);
-    };
-    auto nearest = std::min_element(vertices.begin(), vertices.end(), comp);
-    return **nearest;
-}
-
-/**
- * Test function used in order to check that the nearest vertex function is working as expected. This function should
- * find the nearest vertex using both the rotation and translation parameters.
- */
-void test_nearest_vertex()
-{
-    // Check obvious near case
-    std::unique_ptr<Vertex> v1 = std::make_unique<Vertex>(Vertex{1,1,M_PI / 4.0, nullptr});
-    Vertex& near = nearest_vertex(*v1);
-
-    vertices.emplace_back(std::move(v1));
-    std::cout << "TEST: Step1 ID was: " << near.id << std::endl;
-
-    std::unique_ptr<Vertex> v2 = std::make_unique<Vertex>(Vertex{.5,.5,M_PI / 2.0, nullptr});
-    near = nearest_vertex(*v2);
-    std::cout << "TEST: Step2 ID was: " << near.id << std::endl;
-    vertices.emplace_back(std::move(v2));
-
-    std::unique_ptr<Vertex> v3 = std::make_unique<Vertex>(Vertex{.8,.8,M_PI / 2.0, nullptr});
-    near = nearest_vertex(*v3);
-    std::cout << "TEST: Step3 ID was: " << near.id << std::endl;
-
-    std::unique_ptr<Vertex> v4 = std::make_unique<Vertex>(Vertex{.9,.9,2*M_PI, nullptr});
-    near = nearest_vertex(*v3);
-    std::cout << "TEST: Step4 ID was: " << near.id << std::endl;
-    //auto v2 = std::make_unique<Vertex>(Vertex{1,1,0, nullptr});
-
-}
-
+  *  Create all fixutres for animation, some of these aren't used yet and I left them 
+  *  so that I would have some boilerplate code later.
+  */
 void setUpWorld(const QRect& screenDims){
     gravity = new b2Vec2(0.0f, -10.0f);
     world = new b2World(*gravity);
@@ -173,18 +195,6 @@ void setUpWorld(const QRect& screenDims){
     b2PolygonShape dynamicBox;
     dynamicBox.SetAsBox(1.0f, 1.0f);
     b2FixtureDef fixtureDef;
-
-    // Platform
-    b2BodyDef platformBodyDef;
-    platformBodyDef.type = b2_dynamicBody;
-    platformBodyDef.position.Set(10.0f, 5.0f);
-    dynamicBox.SetAsBox(1.0f, 0.3f);
-    platform = world->CreateBody(&platformBodyDef);
-    fixtureDef.shape = &dynamicBox;
-    fixtureDef.density = 10.0f;
-    fixtureDef.friction = 0.7f;
-    fixtureDef.restitution = 0.1f;
-    platform->CreateFixture(&fixtureDef);
 
 
     // Left Wall
@@ -234,14 +244,42 @@ void setUpWorld(const QRect& screenDims){
     b2PolygonShape centerBox;
     b2FixtureDef centerFixture;
     centerDef.type = b2_staticBody;
-    centerDef.position.Set(WINDOW_HEIGHT * aspect_ratio/2.0, WINDOW_HEIGHT/2);
+    centerDef.position.Set(WINDOW_HEIGHT * aspect_ratio * .2, WINDOW_HEIGHT*.25);
     centerWall = world->CreateBody(&centerDef);
-    centerBox.SetAsBox(1.0, 3);
+    centerBox.SetAsBox(1.0, 2);
     fixtureDef.restitution = .01;
     fixtureDef.shape = &centerBox;
     fixtureDef.density = 1.0f;
     fixtureDef.friction = 0.1f;
     centerWall->CreateFixture(&fixtureDef);
+
+    // Second center wall
+    b2BodyDef center2Def;
+    b2PolygonShape center2Box;
+    b2FixtureDef center2Fixture;
+    center2Def.type = b2_staticBody;
+    center2Def.position.Set(WINDOW_HEIGHT * aspect_ratio * 0.4f, WINDOW_HEIGHT*.75);
+    center2Wall = world->CreateBody(&center2Def);
+    center2Box.SetAsBox(1.0, 3);
+    fixtureDef.restitution = .01;
+    fixtureDef.shape = &center2Box;
+    fixtureDef.density = 1.0f;
+    fixtureDef.friction = 0.1f;
+    center2Wall->CreateFixture(&fixtureDef);
+
+    // Third center wall
+    b2BodyDef center3Def;
+    b2PolygonShape center3Box;
+    b2FixtureDef center3Fixture;
+    center3Def.type = b2_staticBody;
+    center3Def.position.Set(WINDOW_HEIGHT * aspect_ratio * 0.6f, WINDOW_HEIGHT*.25);
+    center3Wall = world->CreateBody(&center3Def);
+    center3Box.SetAsBox(1.0, 3);
+    fixtureDef.restitution = .01;
+    fixtureDef.shape = &center3Box;
+    fixtureDef.density = 1.0f;
+    fixtureDef.friction = 0.1f;
+    center3Wall->CreateFixture(&fixtureDef);
 
     // Goal
     b2BodyDef goalDef;
@@ -258,15 +296,16 @@ void setUpWorld(const QRect& screenDims){
     goalBody->CreateFixture(&goalFixture);
 
 
-    // Create Collision Region
-    collisionShape.SetAsBox(1.0f, 1.0f);
-    collisionTransform.p.Set(1.5, WINDOW_HEIGHT - 1.5);
+    robotShape.SetAsBox(2.0, 0.5);
+    robotTransform.Set(b2Vec2{2.0, WINDOW_HEIGHT / 2.0f}, 0);
 
-    robotShape.SetAsBox(1.0, 0.3f);
-    robotTransform.Set(b2Vec2{WINDOW_HEIGHT * aspect_ratio * 0.2f, WINDOW_HEIGHT / 2.0f}, 0);
+    // Make sure the bodies list is populated
+    bodies = {centerWall, center2Wall, center3Wall, groundBody, leftWall, rightWall, topWall};
 
-    vertices.emplace_back(std::make_unique<Vertex>(Vertex{0, 0, 0, nullptr}));
-    test_nearest_vertex();
+    auto* initialVertex = new Vertex(2, 4, M_PI_2,nullptr);
+    vertices.push_back(initialVertex);
+    tree = new keith::Octree<Vertex>{Kpoint{2,4,M_PI_2}, initialVertex, Kpoint{10, 5, M_PI_2}, 20, 10, 2 * M_PI};
+    tree->delete_user_data = true;  // Need to clean up verticies
 
     // Don't run this twice
     initialized = true;
@@ -288,6 +327,12 @@ Helper::Helper()
 
 Helper::~Helper()
 {
+    if (tree != nullptr)
+    {
+        delete tree;
+        vertices.clear();
+        goal_points.clear();
+    }
     delete world;
     delete gravity;
 }
@@ -321,69 +366,133 @@ void drawBox(QPainter* painter, const b2Shape& draw_shape, const b2Transform& tr
 }
 
 /**
- * Basic collison checking yielding whether two bodies are touching
- * @param shape
- * @param pos
- * @return
- */
-bool checkEndCollison(b2Shape* shape, b2Transform& start_trans, b2Transform& end_trans)
+  *  From the new to the previous point check if there is an unobstructed path between them. This
+  *  is not optimized at all, more a blunt trauma check. The Check collion proceeds 10cm increments
+  *  with 10 degrees rotation each step, whichever covers less distance.
+  */
+bool checkCollision(Vertex* new_vertex, Vertex* nearest_vertex)
 {
-    b2Sweep sweepA;
-    sweepA.localCenter.SetZero();
-    sweepA.c0 = start_trans.p;
-    sweepA.c = end_trans.p;
-    sweepA.a0 = start_trans.q.GetAngle();
-    sweepA.a = end_trans.q.GetAngle();
-    sweepA.alpha0 = 0;
 
-    b2Fixture& platformFixture = platform->GetFixtureList()[0];
-    b2Shape* platformShape = platformFixture.GetShape();
-    const b2Transform& platformTransform = platform->GetTransform();
-    b2Sweep sweepB;
-    sweepB.localCenter.SetZero();
-    sweepB.c0 = platformTransform.p;
-    sweepB.c = platformTransform.p;
-    sweepB.a = platformTransform.q.GetAngle();
-    sweepB.a0 = platformTransform.q.GetAngle();
-    sweepB.alpha0 = 0;
+    b2Transform new_vertex_transform{b2Vec2{static_cast<float>(new_vertex->x), static_cast<float>(new_vertex->y)},
+                                     b2Rot{static_cast<float>(new_vertex->theta)}};
 
+    b2Transform nearest_vertex_transform{b2Vec2{static_cast<float>(nearest_vertex->x), static_cast<float>(nearest_vertex->y)},
+                                         b2Rot{static_cast<float>(nearest_vertex->theta)}};
 
-    b2TOIInput toiInput{};
-    toiInput.sweepA = sweepA;
-    toiInput.sweepB = sweepB;
-    toiInput.proxyA.Set(shape, 0);
-    toiInput.proxyB.Set(platformShape, 0);
-    toiInput.tMax = 0;
+    for (auto& body : bodies)
+    {
+        auto body_shape = body->GetFixtureList()[0].GetShape();
+        auto body_transform = body->GetTransform();
+        if(keith::Utils::hasCollision(&robotShape, new_vertex_transform, nearest_vertex_transform, body_shape,
+                body_transform)){
+           return true;
+        }
+    }
 
-    b2TOIOutput toiOutput{};
-
-    b2TimeOfImpact(&toiOutput, &toiInput);
-    //switch(toiOutput.state)
-    //{
-
-    //    case b2TOIOutput::e_unknown:
-    //        std::cout << "State unknown" << std::endl;
-    //        break;
-    //    case b2TOIOutput::e_failed:
-    //        std::cout << "State failed" << std::endl;
-    //        break;
-    //    case b2TOIOutput::e_overlapped:
-    //        std::cout << "State overlapped" << std::endl;
-    //        break;
-    //    case b2TOIOutput::e_touching:
-    //        std::cout << "State touching" << std::endl;
-    //        break;
-    //    case b2TOIOutput::e_separated:
-    //        std::cout << "State separated" << std::endl;
-    //        break;
-    //}
-
-    return toiOutput.state != b2TOIOutput::e_separated;
+    return false;
 }
+
+
+/**
+  *  This function takes the position of the slider, figures out how far along the 
+  *  goal path the object is then animates it at the correct position
+  */
+void animateGoalPath(QPainter *painter, int percent)
+{
+    if(goal_points.empty()){return;}
+    Vertex* goal_point = goal_points[0];
+    Vertex* curr_point = goal_point;
+    float distance_sq = 0;
+    auto cmp_dist = [&](Vertex* a, Vertex* b){
+        auto dx = a->x - b->x;
+        auto dy = a->y - b->y;
+        return dx * dx + dy * dy;
+    };
+
+    // Add all the elements to the list
+    std::list<Vertex*> goal_path;
+    while(curr_point->p_vertex != nullptr) {
+        goal_path.push_back(curr_point);
+        distance_sq += cmp_dist(curr_point, curr_point->p_vertex);
+        curr_point = curr_point->p_vertex;
+    }
+    goal_path.push_back(curr_point); // Get the beginning point
+
+    float target_dist = distance_sq * (static_cast<float>(percent) / 100.0f);
+    float current_dist = 0;
+    auto curr_vertex_it = goal_path.rbegin();
+    while(current_dist < target_dist && std::next(curr_vertex_it) != goal_path.rend()){
+        auto curr = *curr_vertex_it;
+        auto next = *std::next(curr_vertex_it);
+        auto new_dist = cmp_dist(curr, next);
+        if (current_dist + new_dist >= target_dist- .001) {
+            // Solve for interpolation and draw
+            auto t = (target_dist - current_dist) / new_dist;
+            auto dx = (next->x - curr->x) * t;
+            auto dy = (next->y - curr->y) * t;
+            auto next_theta= next->theta;
+            auto curr_theta = curr->theta;
+
+            // Make sure theta values do not overflow
+            if(next_theta > M_PI){next_theta -= 2*M_PI;} 
+            if(curr_theta > M_PI){curr_theta-= 2*M_PI;}
+            auto total_theta = (next_theta - curr_theta);
+            if (total_theta > M_PI){total_theta -= M_PI;} else if(total_theta < -M_PI){total_theta += M_PI;}
+            auto dtheta = total_theta * t;
+            auto new_theta = curr->theta + dtheta;
+            if(new_theta > 2*M_PI){new_theta -= 2 * M_PI;}else if (new_theta < 0){new_theta+=2*M_PI;}
+
+            // Helpful debug
+            // std::cout << "Distance x: " << dx << " y: " << dy << " theta: " << new_theta << std::endl;
+
+            b2Transform trans{b2Vec2(curr->x + dx, curr->y + dy),
+                              b2Rot(new_theta)};
+
+            b2Transform trans2{b2Vec2{(float) curr->x, (float)curr->y}, b2Rot{(float) (curr->theta)}};
+
+            drawBox(painter, robotShape, trans, QColor(127, 0, 255));
+        }
+        current_dist += new_dist;
+        curr_vertex_it++;
+    }
+}
+
+void addNewPoint()
+{
+
+    // Generate a random vertex
+    Vertex* vertex = createNewVertex();
+
+    double closestDistance;
+    Kpoint nearestNeighborPoint{vertex->x, vertex->y, vertex->theta};
+    Vertex* nearest;
+    Kpoint closestPoint;
+    tree->nearestNeighbor(nearestNeighborPoint, closestDistance, closestPoint, nearest);
+    assert(nearest != nullptr);
+
+    if (!checkCollision(vertex, nearest))
+    {
+
+        insert_intermediary_vertices(vertex, nearest);
+        tree->insert(Kpoint{vertex->x, vertex->y, vertex->theta}, vertex);
+        if (goalBody->GetFixtureList()[0].TestPoint( b2Vec2{static_cast<float>(vertex->x),
+                                                            static_cast<float>(vertex->y)}))
+        {
+            goal_points.emplace_back(vertex);
+        }
+        else{
+            vertices.emplace_back(vertex);
+        }
+    }
+    else{
+        delete vertex;
+    }
+}
+
 void Helper::paint(QPainter *painter, QPaintEvent *event, int elapsed)
 {
 
-    // Calculate time steps
+    // Calculate time steps -- for dynamics
     static std::chrono::time_point last_time = std::chrono::high_resolution_clock::now();
     std::chrono::time_point current_time = std::chrono::high_resolution_clock::now();
     auto step = (current_time - last_time).count() / 1e9;
@@ -393,14 +502,9 @@ void Helper::paint(QPainter *painter, QPaintEvent *event, int elapsed)
     // Save the painter state
     painter->save();
 
-    // Set the simulation
-    world->Step(step, velocityIterations, positionIterations);
-    // Create the world and mark that it is created
+    //world->Step(step, velocityIterations, positionIterations);
 
     painter->fillRect(event->rect(), background);
-
-    gravity->Set(commands->gravity_x * 0.5f, commands->gravity_y * 0.5f);
-    world->SetGravity(*gravity);
 
     float height_ratio =  event->rect().height() / 10.0f;
     float width_ratio = event->rect().width() / (10.0f * aspect_ratio);
@@ -408,28 +512,24 @@ void Helper::paint(QPainter *painter, QPaintEvent *event, int elapsed)
     // Set the window to use world coordinates with a window height of 10m
     QTransform new_coordinates(width_ratio, 0, 0, -1.0f*height_ratio, 0, event->rect().height());
     painter->setTransform(new_coordinates);
-    //gearA->ApplyTorque(10, true);
 
-    platform->SetAwake(true);
-    platform->ApplyTorque(.2, true);
-    drawBox(painter, *platform->GetFixtureList()[0].GetShape(), platform->GetTransform(), QColor(255, 0, 0));
     drawBox(painter, *groundBody->GetFixtureList()[0].GetShape(), groundBody->GetTransform());
     drawBox(painter, *leftWall->GetFixtureList()[0].GetShape(), leftWall->GetTransform());
     drawBox(painter, *rightWall->GetFixtureList()[0].GetShape(), rightWall->GetTransform());
     drawBox(painter, *topWall->GetFixtureList()[0].GetShape(), topWall->GetTransform());
     drawBox(painter, *centerWall->GetFixtureList()[0].GetShape(), centerWall->GetTransform());
     drawBox(painter, *goalBody->GetFixtureList()[0].GetShape(), goalBody->GetTransform(), QColor(0,255,0));
-    drawBox(painter, collisionShape, collisionTransform, QColor(0,0,255));
-    drawBox(painter, robotShape, robotTransform, QColor(0,0,255));
-   // drawBox(painter, pendulum, 1, 1);
-    //drawBox(painter, groundBody, 1, 11);
+    drawBox(painter, *center2Wall->GetFixtureList()[0].GetShape(), center2Wall->GetTransform());
+    drawBox(painter, *center3Wall->GetFixtureList()[0].GetShape(), center3Wall->GetTransform());
 
-    if(!checkEndCollison(&robotShape, robotTransform, robotTransform))
+    // Add new points if we don't have a path
+    if(goal_points.empty())
     {
-
+        for (int i = 0; i < 1e4; i++){addNewPoint();}
     }
 
     painter->save();
+
     // Draw All Vertices
     for (const auto& vertex : vertices)
     {
@@ -440,9 +540,41 @@ void Helper::paint(QPainter *painter, QPaintEvent *event, int elapsed)
         painter->setPen(pen);
         painter->drawLine(QPointF(vertex->x, vertex->y), QPointF(vertex->p_vertex->x, vertex->p_vertex->y));
     }
-    painter->restore();
+
+    // Simple smoothing of goal points -- see if points can be skipped
+    if (!goal_points.empty())
+    {
+        auto* curr_search = goal_points[0];
+        while(curr_search != nullptr && curr_search->p_vertex != nullptr)
+        {
+            auto* curr = curr_search->p_vertex;
+            while(curr->p_vertex != nullptr && !checkCollision(curr->p_vertex,curr_search))
+            {
+                curr = curr->p_vertex;
+            }
+            curr_search->p_vertex = curr;
+            curr_search = curr;
+        }
+    }
+
+    // Draw the goal path
+    for (const Vertex* vertex : goal_points)
+    {
+        auto curr_vertex = vertex;
+        while(curr_vertex->p_vertex != nullptr) {
+            QPen pen;
+            pen.setWidth(0.1f);
+            pen.setColor(Qt::green);
+            painter->setPen(pen);
+            painter->drawLine(QPointF(curr_vertex->x, curr_vertex->y),
+                    QPointF(curr_vertex->p_vertex->x, curr_vertex->p_vertex->y));
+            curr_vertex = curr_vertex->p_vertex;
+        }
+    }
+
+    // Animate the objects path
+    animateGoalPath(painter, commands->g_percent);
 
     painter->restore();
-
-
+    painter->restore();
 }

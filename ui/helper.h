@@ -9,6 +9,7 @@
 struct UiCommands {
     float gravity_x = 0.0f;
     float gravity_y = 0.0f;
+    float g_percent = 0.0f;
 };
 class Helper
 {

@@ -23,6 +23,9 @@ void GLWidget::y_update(const int& value){
 void GLWidget::x_update(const int& value){
     this->commands.gravity_x = static_cast<float>(value - 50) / 50.0f * 10;
 }
+void GLWidget::g_update(const int& value){
+    this->commands.g_percent = value;
+}
 void GLWidget::paintEvent(QPaintEvent *event)
 {
     QPainter painter;

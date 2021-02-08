@@ -20,6 +20,7 @@ public slots:
     void animate();
     void y_update(const int& value);
     void x_update(const int& value);
+    void g_update(const int& value);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
