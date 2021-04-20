@@ -3,13 +3,15 @@ This code is a sample implementation of a RRT algorithm with an rrt backend. The
 
 ## Building
 
-Depends on [box2d](https://github.com/erincatto/box2d)
+Depends on [box2d](https://github.com/erincatto/box2d) Please make install this using provided instructions so that CMake can find it.
 ```
 
 cd rrt-2d-rotation
 mkdir build
 cd build
 cmake ..
+make 
+./rrt_2d
 ```
 
 
