@@ -1,5 +1,5 @@
 # RRT-2D-Rotation
-This code is a sample implementation of a RRT algorithm with an rrt backend. The 3 dimensions are 2D translation and 1D rotation. The display is written with Qt and the collion detection is written with box2d. The algorithm works as follows, a hardcoded set of obstacles are created, a hard coded start point is chose, and goal is hard coded as well. System starts up and searches from the start point toward the goal following the RRT algorithm and avoiding obstacles. For the RRT algorithm the nearest point is chosen using an Octree lookup. The main code is in ui/Helper.cpp --> this calls out to rrt_2d/Octree.h and src/Utils.cpp. The rest is just making QT cooperate. 
+This code is a sample implementation of a RRT algorithm with an Octree for nearest neighbor search. The 3 dimensions are 2D translation and 1D rotation. The display is written with Qt and the collison detection is written with box2d. The algorithm works as follows, a hardcoded set of obstacles are created, a hard coded start point is chosen, and goal is hard coded as well. System starts up and searches from the start point toward the goal following the RRT algorithm and avoiding obstacles. For the RRT algorithm the nearest point is chosen using an Octree lookup. The main code is in ui/Helper.cpp --> this calls out to rrt_2d/Octree.h and src/Utils.cpp. The rest is just making QT cooperate. 
 
 
 
@@ -25,7 +25,7 @@ The octree is written with the X and Y axis representing translation with vertic
 Once a path is found it is cleaned up by iterating back through previous points and seeing if points can be ommitted without creating a collision
 
 ## Gridmap
-Old code, basically a very inefficient search that expands outwards from a cube like an onion. I wasn't sure if this would work, it does but not nearly as well as the octree so I threw this out.
+Old code, basically a very inefficient search that expands outwards from a cube like an onion. I wasn't sure if this would work, it does, but not nearly as well as the octree so I threw this out.
 
 ## License
 This code is meant for show -- do not use. There is no warranty either stated or implied. 
